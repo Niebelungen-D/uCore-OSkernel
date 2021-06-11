@@ -344,7 +344,7 @@ _asm_volatile("int $0x80"
 
 ## 练习1
 
-> 理解通过make生成执行文件的过程
+**理解通过make生成执行文件的过程**
 
 这个练习需要对Makefile有一定的了解。
 
@@ -590,7 +590,7 @@ $(call add_files_cc,$(call listf_cc,$(KSRCDIR)),kernel,$(KCFLAGS))
 KOBJS	= $(call read_packet,kernel libs)
 ```
 
-一个被系统认为是符合规范的硬盘主引导扇区的特征是什么？
+**一个被系统认为是符合规范的硬盘主引导扇区的特征是什么？**
 
 code: sign.c
 
@@ -600,4 +600,433 @@ code: sign.c
     buf[511] = 0xAA;
 	...
 ```
+
+## 练习2
+
+**使用qemu执行并调试lab1中的软件**
+
+在开始debug之前，我们参考其实验报告中的提示将`/tools/gdbinit`的内容修改如下：
+
+```bash
+file bin/kernel
+set architecture i8086
+target remote :1234
+b* 0x7c00
+
+define hook-stop
+x/i $eip
+end
+continue
+```
+
+之后使用`make debug`就可以进行调试。
+
+> 这里pwndbg插件无法进行调试，只能使用peda了
+
+![image-20210610205636075](https://raw.githubusercontent.com/Niebelungen-D/Imgbed-blog/main/img/20210610205649.png)
+
+也可以直接对答案进行调试，使用`make lab1-mon`。
+
+下面我们将反汇编得到的代码与bootasm.S和 bootblock.asm进行比较：
+
+```assembly
+gdb-peda$ x/10i
+   0x7c02:	xor    eax,eax
+   0x7c04:	mov    ds,eax
+   0x7c06:	mov    es,eax
+   0x7c08:	mov    ss,eax
+   0x7c0a:	in     al,0x64
+   0x7c0c:	test   al,0x2
+   0x7c0e:	jne    0x7c0a
+   0x7c10:	mov    al,0xd1
+   0x7c12:	out    0x64,al
+   0x7c14:	in     al,0x64
+```
+
+而在`bootblock.asm`中
+
+```assembly
+00007c00 <start>:
+
+# start address should be 0:7c00, in real mode, the beginning address of the running bootloader
+.globl start
+start:
+.code16                                             # Assemble for 16-bit mode
+    cli                                             # Disable interrupts
+    7c00:	fa                   	cli    
+    cld                                             # String operations increment
+    7c01:	fc                   	cld    
+
+    # Set up the important data segment registers (DS, ES, SS).
+    xorw %ax, %ax                                   # Segment number zero
+    7c02:	31 c0                	xor    %eax,%eax
+    movw %ax, %ds                                   # -> Data Segment
+    7c04:	8e d8                	mov    %eax,%ds
+    movw %ax, %es                                   # -> Extra Segment
+    7c06:	8e c0                	mov    %eax,%es
+    movw %ax, %ss                                   # -> Stack Segment
+    7c08:	8e d0                	mov    %eax,%ss
+```
+
+当你删除`gdbinit`中的`continue`后，就可以调试从BIOS开始的指令。非常有趣的一点是，记得吗，执行BIOS时，cpu还在实模式，而gdb默认只输出`$ip` 所指向地址的指针，而不是`cs:ip`。正确的指令应该是这样：
+
+```bash
+gdb-peda$ x/5i (($cs<<4)+$eip)
+   0xffff0:     jmp    0x3630:0xf000e05b
+   0xffff7:     das
+   0xffff8:     xor    dh,BYTE PTR [ebx]
+   0xffffa:     das
+   0xffffb:     cmp    DWORD PTR [ecx],edi
+   
+gdb-peda$ x/5i (($cs<<4)+$eip)
+   0xfe05b:     cmp    WORD PTR cs:[esi],0xffc8
+   0xfe060:     bound  eax,QWORD PTR [eax]
+   0xfe062:     jne    0xd241d0b2
+   0xfe068:     mov    ss,edx
+   0xfe06a:     mov    sp,0x7000
+```
+
+（感谢[@2st](https://github.com/M-ouse)&[@kiprey](https://github.com/Kiprey)）
+
+## 练习3
+
+**分析bootloader进入保护模式的过程**
+
+```assembly
+start:
+.code16                                             # Assemble for 16-bit mode
+    cli                                             # Disable interrupts
+    cld                                             # String operations increment
+
+    # Set up the important data segment registers (DS, ES, SS).
+    xorw %ax, %ax                                   # Segment number zero
+    movw %ax, %ds                                   # -> Data Segment
+    movw %ax, %es                                   # -> Extra Segment
+    movw %ax, %ss                                   # -> Stack Segment
+```
+
+首先，`cli`禁用中断，它的全称为`Clear Interupt`。`cld(Clear Direction)`设置了字节的传输从低位开始。清空重要的段寄存器。
+
+> cld指令使变址寄存器SI或DI的地址指针自动增加，从前向后处理。
+
+### 有关A20？
+
+- 为什么要开启A20？
+
+  Intel早期的8086 CPU提供了20根地址线，但寄存器只有16位，所以使用**段寄存器值 << 4 + 段内偏移值**的方法来访问到所有内存，但按这种方式来计算出的地址的最大值为1088KB，超过20根地址线所能表示的范围，会发生“回卷”(memory wraparound)（和整数溢出有点类似）。但下一代的基于Intel 80286 CPU的计算机系统提供了24根地址线，当CPU计算出的地址超过1MB时便**不会发生回卷**，而这就造成了**向下不兼容**。为了保持完全的向下兼容性，IBM在计算机系统上加个硬件逻辑来模仿早期的回绕特征，而这就是**A20 Gate**。
+
+- 如何开启A20？
+
+  - A20 Gate的方法是把A20地址线控制和键盘控制器的一个输出进行AND操作，这样来控制A20地址线的打开（使能）和关闭（屏蔽\禁止）。一开始时A20地址线控制是被屏蔽的（总为0），直到系统软件通过一定的IO操作去打开它。当A20 地址线控制禁止时，则程序就像在8086中运行，1MB以上的地址不可访问；保护模式下A20地址线控制必须打开。A20控制打开后，内存寻址将不会发生回卷。
+  - 通常的方法是通过设置键盘控制器的端口值，不过有些系统觉得键盘控制器很慢，为此引入了一个Fast Gate A20，它用IO端口的0x92来处理A20信号线。还有一种方法是通过读取0xee端口来开启A20地址线，写端口则会禁止地址线。
+  - 从理论上讲，打开A20 Gate的方法是通过设置8042芯片输出端口（64h）的2nd-bit，但事实上，当你向8042芯片输出端口进行写操作的时候，在键盘缓冲区中或许还有别的数据尚未处理，因此你必须首先处理这些数据。  所以，激活A20地址线的流程为：  1.禁止中断；2.等待，直到8042 Input buffer为空为止； 3.发送Write 8042 Output Port命令到8042 Input buffer；4.等待，直到8042 Input buffer为空为止；5.向P2写入数据，将OR2置1
+  
+  （关于激活我没有找到很详细的资料，只有[A20激活详解](https://wenku.baidu.com/view/d6efe68fcc22bcd126ff0c00.html)）
+
+![image-20210611190136028](https://raw.githubusercontent.com/Niebelungen-D/Imgbed-blog/main/img/20210611190136.png)
+
+启动A20的汇编代码如下
+
+```assembly
+    # Enable A20:
+    #  For backwards compatibility with the earliest PCs, physical
+    #  address line 20 is tied low, so that addresses higher than
+    #  1MB wrap around to zero by default. This code undoes this.
+seta20.1:               # 等待8042键盘控制器不忙
+    inb $0x64, %al      # 从0x64键盘缓冲区接收消息
+    testb $0x2, %al     # 如果接受到2则表明键盘缓冲区为空
+    jnz seta20.1        #
+
+    movb $0xd1, %al     # 发送写8042输出端口的指令
+    outb %al, $0x64     # 0xd1表示写输出端口P2
+
+seta20.1:               # 等待8042键盘控制器不忙
+    inb $0x64, %al      # 
+    testb $0x2, %al     #
+    jnz seta20.1        #
+
+    movb $0xdf, %al     # 0xdf --> P2
+    outb %al, $0x60     # 1101 1111 ，P2的P21置为1
+```
+
+### 如何初始化GDT表？
+
+```assembly
+# Bootstrap GDT
+.p2align 2                                          # force 4 byte alignment
+gdt:
+    SEG_NULLASM                                     # null seg
+    SEG_ASM(STA_X|STA_R, 0x0, 0xffffffff)           # code seg for bootloader and kernel
+    SEG_ASM(STA_W, 0x0, 0xffffffff)                 # data seg for bootloader and kernel
+
+gdtdesc:
+    .word 0x17                                      # sizeof(gdt) - 1
+    .long gdt                                       # address gdt
+```
+
+- 设置表中第一项为`NULL`
+- 表中第二项为代码段描述符，可读可执行
+- 表中第二项为数据段描述符，可写
+
+回到bootloader的代码
+
+```assembly
+    # Switch from real to protected mode, using a bootstrap GDT
+    # and segment translation that makes virtual addresses
+    # identical to physical addresses, so that the
+    # effective memory map does not change during the switch.
+    lgdt gdtdesc
+    movl %cr0, %eax
+    orl $CR0_PE_ON, %eax
+    movl %eax, %cr0
+```
+
+在开启A20之后，加载了`GDT`全局描述符表，它是被静态储存在引导区中的，载入即可。
+
+接着，将`cr0`寄存器的bit 0置为1，标志着从实模式转换到保护模式。
+
+```assembly
+    # Jump to next instruction, but in 32-bit code segment.
+    # Switches processor into 32-bit mode.
+    ljmp $PROT_MODE_CSEG, $protcseg
+```
+因为长跳转可以设置其`cs`寄存器，所以使用一个长跳转进入32位指令模式执行。
+```assembly
+.code32                                             # Assemble for 32-bit mode
+protcseg:
+    # Set up the protected-mode data segment registers
+    movw $PROT_MODE_DSEG, %ax                       # Our data segment selector
+    movw %ax, %ds                                   # -> DS: Data Segment
+    movw %ax, %es                                   # -> ES: Extra Segment
+    movw %ax, %fs                                   # -> FS
+    movw %ax, %gs                                   # -> GS
+    movw %ax, %ss                                   # -> SS: Stack Segment
+
+    # Set up the stack pointer and call into C. The stack region is from 0--start(0x7c00)
+    movl $0x0, %ebp
+    movl $start, %esp
+    call bootmain
+
+    # If bootmain returns (it shouldn't), loop.
+spin:
+    jmp spin
+```
+
+设置各段寄存器，并建立堆栈（0~0x7c00），最后进入`bootmain`函数（in bootmain.c）中。
+
+## 练习4
+
+#### 分析bootloader加载ELF格式的OS的过程
+
+```c
+unsigned int    SECTSIZE  =      512 ;
+struct elfhdr * ELFHDR    =      ((struct elfhdr *)0x10000) ;     // scratch space
+
+/* bootmain - the entry of bootloader */
+void
+bootmain(void) {
+    // read the 1st page off disk
+    readseg((uintptr_t)ELFHDR, SECTSIZE * 8, 0);
+
+    // is this a valid ELF?
+    if (ELFHDR->e_magic != ELF_MAGIC) {
+        goto bad;
+    }
+
+    struct proghdr *ph, *eph;
+
+    // load each program segment (ignores ph flags)
+    ph = (struct proghdr *)((uintptr_t)ELFHDR + ELFHDR->e_phoff);
+    eph = ph + ELFHDR->e_phnum;
+    for (; ph < eph; ph ++) {
+        readseg(ph->p_va & 0xFFFFFF, ph->p_memsz, ph->p_offset);
+    }
+
+    // call the entry point from the ELF header
+    // note: does not return
+    ((void (*)(void))(ELFHDR->e_entry & 0xFFFFFF))();
+
+bad:
+    outw(0x8A00, 0x8A00);
+    outw(0x8A00, 0x8E00);
+
+    /* do nothing */
+    while (1);
+}
+```
+
+首先，从硬盘读取一页（512*8）的内容加载到`0x10000`。
+
+现在考虑它是如何读取的？
+
+bootloader让CPU进入保护模式后，下一步的工作就是从硬盘上加载并运行OS。考虑到实现的简单性，bootloader的访问硬盘都是LBA模式的PIO（Program IO）方式，即所有的IO操作是通过CPU访问硬盘的IO地址寄存器完成。
+
+一般主板有2个IDE通道，每个通道可以接2个IDE硬盘。访问第一个硬盘的扇区可设置IO地址寄存器0x1f0-0x1f7实现的，具体参数见下表。一般第一个IDE通道通过访问IO地址0x1f0-0x1f7来实现，第二个IDE通道通过访问0x170-0x17f实现。每个通道的主从盘的选择通过第6个IO偏移地址寄存器来设置。
+
+第6位：为1=LBA模式；0 = CHS模式 第7位和第5位必须为1
+
+| IO地址 | 功能                                                         |
+| :----: | :----------------------------------------------------------- |
+| 0x1f0  | 读数据，当0x1f7不为忙状态时，可以读。                        |
+| 0x1f2  | 要读写的扇区数，每次读写前，你需要表明你要读写几个扇区。最小是1个扇区 |
+| 0x1f3  | 如果是LBA模式，就是LBA参数的0-7位                            |
+| 0x1f4  | 如果是LBA模式，就是LBA参数的8-15位                           |
+| 0x1f5  | 如果是LBA模式，就是LBA参数的16-23位                          |
+| 0x1f6  | 第0~3位：如果是LBA模式就是24-27位 第4位：为0主盘；为1从盘    |
+| 0x1f7  | 状态和命令寄存器。操作时先给命令，再读取，如果不是忙状态就从0x1f0端口读数据 |
+当前 硬盘数据是储存到硬盘扇区中，一个扇区大小为512字节。读一个扇区的流程大致如下：
+
+1. 等待磁盘准备好
+2. 发出读取扇区的命令
+3. 等待磁盘准备好
+4. 把磁盘扇区数据读到指定内存
+
+在c代码中是这样实现的，`readseg()`是`readsect()`的一个封装：
+
+```c
+/* readsect - read a single sector at @secno into @dst */
+static void
+readsect(void *dst, uint32_t secno) {
+    // wait for disk to be ready
+    waitdisk();
+
+    outb(0x1F2, 1);                         // count = 1
+    outb(0x1F3, secno & 0xFF);
+    outb(0x1F4, (secno >> 8) & 0xFF);
+    outb(0x1F5, (secno >> 16) & 0xFF);
+    outb(0x1F6, ((secno >> 24) & 0xF) | 0xE0);
+    outb(0x1F7, 0x20);                      // cmd 0x20 - read sectors
+
+    // wait for disk to be ready
+    waitdisk();
+
+    // read a sector
+    insl(0x1F0, dst, SECTSIZE / 4);
+}
+
+/* waitdisk - wait for disk ready */
+static void
+waitdisk(void) {
+    while ((inb(0x1F7) & 0xC0) != 0x40)
+        /* do nothing */;
+}
+
+static inline void
+outb(uint16_t port, uint8_t data) {
+    asm volatile ("outb %0, %1" :: "a" (data), "d" (port) : "memory");
+}
+```
+
+加载到磁盘后，判断其是否是一个合法的ELF：
+
+```c
+    // is this a valid ELF?
+    if (ELFHDR->e_magic != ELF_MAGIC) {
+        goto bad;
+    }
+```
+
+如果合法则：
+
+```c
+    // load each program segment (ignores ph flags)
+    // 在ELF文件头中，有描述符表记录了ELF文件应该加载到什么位置 
+    // 将描述符表保存到ph中
+    ph = (struct proghdr *)((uintptr_t)ELFHDR + ELFHDR->e_phoff);
+    eph = ph + ELFHDR->e_phnum;
+    // 按照描述表将ELF文件中数据载入内存 
+    for (; ph < eph; ph ++) {
+        readseg(ph->p_va & 0xFFFFFF, ph->p_memsz, ph->p_offset);
+    }
+
+    // call the entry point from the ELF header
+    // note: does not return
+    // 内核入口
+    ((void (*)(void))(ELFHDR->e_entry & 0xFFFFFF))();
+```
+
+## 练习5
+
+**实现函数调用堆栈跟踪函数**
+
+```c
+void
+print_stackframe(void) {
+    uint32_t ebp = read_ebp();
+    uint32_t eip = read_eip();
+
+    for(uint32_t i = 0; ebp != 0 && i < STACKFRAME_DEPTH; i++) {
+        cprintf("ebp: 0x%08x eip: 0x%08x, arg:", ebp, eip);
+        uint32_t *arg = (uint32_t *)ebp + 2;
+        for(uint32_t j = 0; j< 4; j++) {
+            cprintf(" 0x%08x", arg[j]);
+        }
+        cprintf("\n");
+        print_debuginfo(eip - 1);
+        eip = *((uint32_t *)ebp + 1);
+        ebp = *(uint32_t *)ebp;
+    }
+}
+```
+
+这里需要对32位c的函数调用有充分的理解
+
+![](https://raw.githubusercontent.com/Niebelungen-D/Imgbed-blog/main/img/20210611230013.jpeg)
+
+涉及到很多指针操作，还有一点要注意的是，`eip`指向的是即将执行的指令，所以如果想要查看当前函数需要`-1`。
+
+## 练习6
+
+**完善中断初始化和处理**
+
+- 中断描述符表（也可简称为保护模式下的中断向量表）中一个表项占多少字节？其中哪几位代表中断处理代码的入口？
+
+code in /kern/mm/mmu.h：
+
+```c
+/* Gate descriptors for interrupts and traps */
+struct gatedesc {
+    unsigned gd_off_15_0 : 16;        // low 16 bits of offset in segment
+    unsigned gd_ss : 16;            // segment selector
+    unsigned gd_args : 5;            // # args, 0 for interrupt/trap gates
+    unsigned gd_rsv1 : 3;            // reserved(should be zero I guess)
+    unsigned gd_type : 4;            // type(STS_{TG,IG32,TG32})
+    unsigned gd_s : 1;                // must be 0 (system)
+    unsigned gd_dpl : 2;            // descriptor(meaning new) privilege level
+    unsigned gd_p : 1;                // Present
+    unsigned gd_off_31_16 : 16;        // high bits of offset in segment
+};
+```
+
+一个表项共有`8*8 = 64 bit`即8字节。其中`gd_ss`是段选择子，`gd_off_15_0`是偏移，通过这两项我们就可以找到中断处理代码的入口。
+
+```c
+void
+idt_init(void) {
+    extern uintptr_t __vectors[];
+    uint32_t i;
+    for(i = 0; i < sizeof(idt); i+= 8)
+    {	// 使用宏设置IDT的每一项
+        // IDT的每一项都是中断且在内核态处理的所以设为`GD_LTEXT`，特权级为`DPL_KERNEL`
+        SETGATE(idt[i], 0, GD_KTEXT, __vectors[i], DPL_KERNEL);
+    }
+    // 系统调用是提供给用户，供其调用的，所以我们要修改其特权级，使其可以在用户态调用
+    SETGATE(idt[T_SWITCH_TOK], 0, GD_KTEXT, __vectors[T_SWITCH_TOK], DPL_USER);
+    // 加载idt
+    lidt(&idt_pd);
+}
+```
+除了系统调用中断(T_SYSCALL)使用陷阱门描述符且权限为用户态权限以外，其它中断均使用特权级(DPL)为０的中断门描述符，权限为内核态权限；而ucore的应用程序处于特权级３，需要采用｀int 0x80`指令操作（这种方式称为软中断，软件中断，Tra中断，在lab5会碰到）来发出系统调用请求，并要能实现从特权级３到特权级０的转换，所以系统调用中断(T_SYSCALL)所对应的中断门描述符中的特权级（DPL）需要设置为３。
+```c
+    char c;
+
+    switch (tf->tf_trapno) {
+    case IRQ_OFFSET + IRQ_TIMER:
+        ticks++;
+        if(ticks % TICK_NUM ==0)
+            print_ticks();
+        break;
+```
+
+每100次时钟中断调用`print_ticks`，这部分看其代码中给的提示很容易编写出来，实验指导中的很模糊。
 

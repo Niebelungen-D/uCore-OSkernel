@@ -82,16 +82,13 @@ sudo apt-get install build-essential git qemu-system vim gdb cgdb make diffutils
 
 与官方的并不是完全一样，在ubuntu20.04中eclipse-cdt改变了安装方式，vim由vim-gnome改为vim。
 
-这里我又安装了gdb的拓展pwndbg（在ctf中经常用到）
+这里我又安装了gdb的拓展peda（在ctf中经常用到），pwndbg在后面发现没法使用。
 
 ```bash
-git clone https://github.com/pwndbg/pwndbg
-cd pwndbg
-./setup.sh
-echo "source /home/neibelungen/Downloads/pwndbg/gdbinit.py" > ~/.gdbinit
+git clone https://github.com/longld/peda.git ~/peda
+echo "source ~/peda/peda.py" >> ~/.gdbinit
+echo "DONE! debug your program with gdb and enjoy"
 ```
-
-这里如果报错，请检查权限，使用sudo再次执行。
 
 vs code用来写代码
 

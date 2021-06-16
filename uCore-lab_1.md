@@ -252,6 +252,222 @@ struct proghdr {
 - 内核态映射到用户态的地址空间，更新页面映射权限
 - 内核独立地址空间，TLB变化
 
+# 特权级
+
+特权级共分为四档，分别为0-3，其中`Kernel`为第0特权级（ring 0），用户程序为第3特权级（ring 3），系统程序分别为第1和第2特权级。
+
+特权级的区别
+
+- 一些指令（例如特权指令`lgdt`）只能运行在ring 0下。
+- CPU在如下时刻会检查特权级
+  - 访问数据段
+  - 访问页
+  - 进入中断服务例程（ISRs）
+  - …
+- 如果检查失败，则会产生**保护异常（General Protection Fault）**
+
+## TSS简介
+
+TSS，即 Task State Segment，意为任务状态段，TSS 是一种数据结构，它用于存储任务的环境。TSS 是每个任务都有的结构，它用于一个任务的标识，相当于任务的身份证，程序拥有此结构才能运行，这是处理器硬件上用于任务管理的系统结构，处理器能够识别其中每一个字段。
+
+![](https://raw.githubusercontent.com/Niebelungen-D/Imgbed-blog/main/img/20210616224957.png)
+
+其中包含了三个栈指针，分别为ring0、ring1、ring2的特权栈。当低特权级向高特权级转换的时候，才会用到这些栈指针进行栈的切换。切换完成后，低特权级的栈指针会被保存在切换后的栈中，通过`retf`或`iret`返回。并不是每个任务都有三个栈指针，因为这些栈指针只有低特权级向高特权级转移时才会用到，所以对于本身就处在ring2的程序是没有ring2的栈指针的，其他同理。切换栈的操作从开始中断的那一瞬间就已完成。
+
+TSS 是硬件支持的系统数据结构，它和GDT 等一样，由软件填写其内容，由硬件使用。GDT 也要加载到寄存器 GDTR 中才能被处理器找到，TSS也是一样，它是由 TR（Task Register）寄存器加载的，每次处理器执行不同任务时，将TR寄存器加载不同任务的TSS就成了。
+
+Code:mmu.h
+
+```c
+/* task state segment format (as described by the Pentium architecture book) */
+struct taskstate {
+    uint32_t ts_link;        // old ts selector
+    uintptr_t ts_esp0;        // stack pointers and segment selectors
+    uint16_t ts_ss0;        // after an increase in privilege level
+    uint16_t ts_padding1;
+    uintptr_t ts_esp1;
+    uint16_t ts_ss1;
+    uint16_t ts_padding2;
+    uintptr_t ts_esp2;
+    uint16_t ts_ss2;
+    uint16_t ts_padding3;
+    uintptr_t ts_cr3;        // page directory base
+    uintptr_t ts_eip;        // saved state from last task switch
+    uint32_t ts_eflags;
+    uint32_t ts_eax;        // more saved state (registers)
+    uint32_t ts_ecx;
+    uint32_t ts_edx;
+    uint32_t ts_ebx;
+    uintptr_t ts_esp;
+    uintptr_t ts_ebp;
+    uint32_t ts_esi;
+    uint32_t ts_edi;
+    uint16_t ts_es;            // even more saved state (segment selectors)
+    uint16_t ts_padding4;
+    uint16_t ts_cs;
+    uint16_t ts_padding5;
+    uint16_t ts_ss;
+    uint16_t ts_padding6;
+    uint16_t ts_ds;
+    uint16_t ts_padding7;
+    uint16_t ts_fs;
+    uint16_t ts_padding8;
+    uint16_t ts_gs;
+    uint16_t ts_padding9;
+    uint16_t ts_ldt;
+    uint16_t ts_padding10;
+    uint16_t ts_t;            // trap on task switch
+    uint16_t ts_iomb;        // i/o map base address
+};
+```
+
+## DPL、RPL、CPL、IOPL
+
+首先要明确一点，在计算机中具备“能动性”的只有计算机指令，只有指令才具备访问、请求其他资源的能力，指令便是资源的请求者。指令“请求”、“访问”其他资源的能力等级便称之为请求特 权级，指令存放在代码段中，所以，就用代码段寄存器 CS 中选择子的 RPL 位表示代码请求别人资源能力的等级。
+
+- DPL，即 Descriptor Privilege Level，描述符特权级，它存在于段描述符中。标识了访问该段的门槛。
+- CPL，Current Privilege Level，它表示处理器正在执行的代码的特权级别。它与当前段的DPL是相同的。
+- RPL，请求特权级，来自发出请求的CS.RPL。
+- IOPL，该位存在于`eflags`字段中。指当前运行任务的I/O特权级(I/O privilege level)，正在运行任务的当前特权级(CPL)必须小于或等于I/O特权级才能允许访问I/O地址空间。这个域只能在CPL为0时才能通过POPF以及IRET指令修改。
+
+对于受访者为数据段（段描述符中 type 字段中未有X可执行属性）来说： 
+
+只有访问者的权限大于等于该 DPL 表示的最低权限才能够继续访问，否则连这个门槛都迈不过去。比如，DPL 为 1 的段描述符，只有特权级为 0、1 的访问者才有资格访问它所代表的资源，特权为 2、3 的访问者会被 CPU 拒之门外。 
+
+对于受访者为代码段（段描述符中 type 字段中含有X可执行属性）来说：
+
+只有访问者的权限等于该 DPL 表示的最低权限才能够继续访问，即只能平级访问。任何权限大于或小于它的访问者都将被 CPU 拒之门外。这是为什么呢？自问自答之前先明确一个概念，对于受访者为代码段一这说法，实际上是指处理器从当前运行的代码段上转移到受访者这个目标代码段上去执行，并不是 说把该目标代码段当数据一样访问，在真实物理机器上，代码段通常情况下是不被当成数据来处理的，但确实可以这么做（话说虚拟机中会把代码当成数据来处理）。
+
+对于数据段和代码段的要求不同，在执行代码时，高特权级的程序几乎不会主动降低自己的特权级，中断的返回除外。
+
+##  trapFrame
+
+- `trapframe`结构是进入中断门所必须的结构，其结构如下
+
+  ```c
+  COPYstruct trapframe {
+      // tf_regs保存了基本寄存器的值，包括eax,ebx,esi,edi寄存器等等
+      struct pushregs tf_regs;
+      uint16_t tf_gs;
+      uint16_t tf_padding0;
+      uint16_t tf_fs;
+      uint16_t tf_padding1;
+      uint16_t tf_es;
+      uint16_t tf_padding2;
+      uint16_t tf_ds;
+      uint16_t tf_padding3;
+      uint32_t tf_trapno;
+      // 以下这些信息会被CPU硬件自动压入切换后的栈。包括下面切换特权级所使用的esp、ss等数据
+      uint32_t tf_err;
+      uintptr_t tf_eip;
+      uint16_t tf_cs;
+      uint16_t tf_padding4;
+      uint32_t tf_eflags;
+      // 以下这些信息会在切换特权级时被使用
+      uintptr_t tf_esp;
+      uint16_t tf_ss;
+      uint16_t tf_padding5;
+  } __attribute__((packed));
+  ```
+
+## 中断处理例程的入口代码
+
+- 中断处理例程的入口代码用于保存上下文并构建一个`trapframe`，其源代码如下：
+
+  ```c
+  COPY  #include <memlayout.h>
+  
+  # vectors.S sends all traps here.
+  .text
+  .globl __alltraps
+  __alltraps:
+      # push registers to build a trap frame
+      # therefore make the stack look like a struct trapframe
+      pushl %ds
+      pushl %es
+      pushl %fs
+      pushl %gs
+      pushal
+  
+      # load GD_KDATA into %ds and %es to set up data segments for kernel
+      movl $GD_KDATA, %eax
+      movw %ax, %ds
+      movw %ax, %es
+  
+      # push %esp to pass a pointer to the trapframe as an argument to trap()
+      pushl %esp
+      # call trap(tf), where tf=%esp
+      call trap
+      # pop the pushed stack pointer
+      popl %esp
+  
+      # return falls through to trapret...
+  .globl __trapret
+  __trapret:
+      # restore registers from stack
+      popal
+  
+      # restore %ds, %es, %fs and %gs
+      popl %gs
+      popl %fs
+      popl %es
+      popl %ds
+  
+      # get rid of the trap number and error code
+      addl $0x8, %esp
+      iret
+  ```
+
+## 切换特权级的过程
+
+### 特权级提升
+
+当通过陷入门**从ring3切换至ring0（特权提升）** 时
+
+- 在陷入的一瞬间，CPU会因为特权级的改变，索引TSS，切换`ss`和`esp`为内核栈，并**按顺序自动**压入`user_ss`、`user_esp`、`user_eflags`、`user_cs`、`old_eip`以及`err`。
+
+  > 需要注意的是，CPU先切换到内核栈，此时的`esp`与`ss`不再指向用户栈。但此时CPU却可以再将用户栈地址存入内核栈。这种操作可能是依赖硬件来完成的。
+
+  > 如果没有err，则CPU会自动压入0。
+
+- 之后CPU会在中断处理例程入口处，先将剩余的段寄存器以及所有的通用寄存器压栈，构成一个`trapframe`。然后将该`trapframe`传入给真正的中断处理例程并执行。
+
+- 该处理例程会判断传入的中断数(`trapno`)并执行特定的代码。在**提升特权级的代码**中，程序会处理传入的`trapframe`信息中的`CS、DS、eflags`寄存器，修改上面的**DPL、CPL与IOPL**以达到提升特权的目的。
+
+- 将修改后的`trapframe`**压入用户栈**（这一步没有修改`user_esp`寄存器），并设置中断处理例程结束后将要弹出`esp`寄存器的值为**用户栈的新地址**（与刚刚不同，这一步修改了**将要恢复**的`user_esp`寄存器）。
+
+  > 注意此时的用户栈地址指向的是修改后的`trapframe`。
+
+  这样在退出中断处理程序，准备恢复上下文的时候，首先弹出的栈寄存器值是修改后的用户栈地址，其次弹出的通用寄存器、段寄存器等等都是存储于用户栈中的`trapframe`。
+
+  > 为什么要做这么奇怪的操作呢？ 因为恢复`esp`寄存器的指令**只有一条`pop %esp`**
+  >
+  > (当前环境下的`iret`指令不会弹出栈地址)。
+  >
+  > 正常情况下，中断处理例程结束，恢复`esp`寄存器后，`esp`指向的还是内核栈。
+  >
+  > 但我们的目的是切换回用户栈，则此时只能修改原先要恢复的`esp`值，通过该指令切换到用户栈。
+
+  > 思考一下，进入中断处理程序前，上下文**保存在内核栈**。但将要恢复回上下文的数据却**存储于用户栈**。
+
+- 在内核中，将修改后的``trapframe`压入用户栈这一步，需要舍弃`trapframe`中末尾两个旧的`ss`和`esp`寄存器数据，因为`iret`指令的特殊性：
+
+  - `iret`指令的功能如下
+
+    > `iret`指令会按顺序依次弹出`eip`、`cs`以及`eflag`的值到特定寄存器中，然后从新的`cs:ip`处开始执行。如果特权级发生改变，则还会在弹出`eflag`后再依次弹出`esp`与`ss`寄存器值。
+
+  - 由于`iret`前后特权级不发生改变（**[中断中]ring0 -> ring0 [中断后]**），故`iret`指令不会弹出`esp`和`ss`寄存器值。如果这两个寄存器也被复制进用户栈，则相比于进入中断前的用户栈地址，`esp`最终会抬高8个字节，可能造成很严重的错误。
+
+### 特权级降低
+
+通过陷入门**从ring0切换至ring3（特权降低）** 的过程与特权提升的操作基本一样，不过有几个不同点需要注意一下
+
+- 与ring3调用中断不同，当ring0调用中断时，进入中断前和进入中断后的这个过程，栈不发生改变。
+
+  > 因为在调用中断前的权限已经处于ring0了，而中断处理程序里的权限也是ring0，所以这一步陷入操作的特权级没有发生改变，故不需要访问TSS并重新设置`ss` 、`esp`寄存器。
+
+- 修改后的`trapFrame`不需要像上面那样保存至将要使用的栈，因为当前环境下`iret`前后特权级会发生改变，执行该命令会弹出`ss`和`esp`，所以可以通过`iret`来设置返回时的栈地址。
+
 # C函数调用的实现
 
 - [C 语言函数调用栈 (一)](http://www.cnblogs.com/clover-toeic/p/3755401.html)
@@ -959,7 +1175,7 @@ print_stackframe(void) {
         cprintf("ebp: 0x%08x eip: 0x%08x, arg:", ebp, eip);
         uint32_t *arg = (uint32_t *)ebp + 2;
         for(uint32_t j = 0; j< 4; j++) {
-            cprintf(" 0x%08x", arg[j]);
+            cprintf("0x%08x ", arg[j]);
         }
         cprintf("\n");
         print_debuginfo(eip - 1);
@@ -1005,7 +1221,7 @@ void
 idt_init(void) {
     extern uintptr_t __vectors[];
     uint32_t i;
-    for(i = 0; i < sizeof(idt); i+= 8)
+    for(i = 0; i < sizeof(idt) / sizeof(struct gatedesc); i ++)
     {	// 使用宏设置IDT的每一项
         // IDT的每一项都是中断且在内核态处理的所以设为`GD_LTEXT`，特权级为`DPL_KERNEL`
         SETGATE(idt[i], 0, GD_KTEXT, __vectors[i], DPL_KERNEL);
@@ -1029,4 +1245,138 @@ idt_init(void) {
 ```
 
 每100次时钟中断调用`print_ticks`，这部分看其代码中给的提示很容易编写出来，实验指导中的很模糊。
+
+## Challenge 1
+
+> 为完成挑战请仔细阅读trap相关的代码、test相关代码以及《操作系统真象还原》-特权级深入浅出一章
+
+在所有中断处理程序中都使用`__alltraps`，它将`trapframe`保存在栈上。在由内核态切换成用户态的时候，一开始调用中断时，由于是从内核态调用的，没有权限切换，故ss、esp没有压栈，而iret返回时，是返回到用户态，故ss、esp会出栈，于是为了保证栈的正确性，需要在调用中断前将esp减8以预留空间，中断返回后，由于esp被修改，还需要手动恢复esp为正确值。
+
+这样之后，系统特权级已经成功切换，但是由于切换到了用户态，导致IO操作没有权限，故之后的printf无法成功输出，为了能够正常输出，我们需要将eflags中的IOPL设成用户级别，即3，同样也是通过修改栈中值来达到修改的目的。
+
+**ring3 -> ring0**
+
+```c
+// 全局变量
+struct trapframe switchk2u;
+// ......
+case T_SWITCH_TOK:
+    if (tf->tf_cs != KERNEL_CS) {
+    tf->tf_cs = KERNEL_CS;			// 修改CPL DPL IOPL
+    tf->tf_ds = tf->tf_es = KERNEL_DS;
+    tf->tf_eflags &= ~FL_IOPL_MASK;
+    // 计算将要保存新trapFrame的用户栈地址
+    // 数值减8是因为内核调用中断时CPU没有压入ss和esp
+    switchu2k = (struct trapframe *)(tf->tf_esp - (sizeof(struct trapframe) - 8));
+    // 将修改后的trapFrame写入用户栈(注意当前是内核栈)。注意trapFrame中ss和esp的值不需要写入。
+    memmove(switchu2k, tf, sizeof(struct trapframe) - 8);
+    // 设置弹出esp的值为用户栈的新地址
+    *((uint32_t *)tf - 1) = (uint32_t)switchu2k;
+}
+break;
+```
+
+**ring0 -> ring3**
+
+```c
+// 全局变量
+struct trapframe *switchu2k;
+// ......
+case T_SWITCH_TOU:
+    if (tf->tf_cs != USER_CS) {
+    // 将中断的栈帧赋给临时中断帧
+    switchk2u = *tf;
+    // 修改可执行代码段为USER_CS
+    switchk2u.tf_cs = USER_CS;
+    // 修改数据段为USER_DS
+    switchk2u.tf_ds = switchk2u.tf_es = switchk2u.tf_ss = USER_DS;
+    // 设置从中断处理程序返回时的栈地址
+    // 数值减8是因为iret不会弹出ss和esp，所以不需要这8个字节
+    switchk2u.tf_esp = (uint32_t)tf + sizeof(struct trapframe) - 8;
+    // 为了使得程序在低CPL的情况下仍然能够使用IO
+    // 需要将eflags中对应的IOPL位置成表示用户态的3
+    switchk2u.tf_eflags |= FL_IOPL_MASK;
+    // 设置中断处理例程结束时pop出的%esp，这样可以用修改后的数据来恢复上下文。
+    *((uint32_t *)tf - 1) = (uint32_t)&switchk2u;
+    }
+    // 事实上上述代码并没有实际完成一个从内核栈到用户态栈的切换
+    // 仅仅是完成了特权级的切换。这属于正常现象。
+break;
+```
+
+**中断**
+
+```c
+static void
+lab1_switch_to_user(void) {
+	asm volatile (
+	    "sub $0x8, %%esp \n"
+	    "int %0 \n"
+	    "movl %%ebp, %%esp"
+	    : 
+	    : "i"(T_SWITCH_TOU)
+	);
+}
+
+static void
+lab1_switch_to_kernel(void) {
+	asm volatile (
+	    "int %0 \n"
+	    "movl %%ebp, %%esp \n"
+	    : 
+	    : "i"(T_SWITCH_TOK)
+	);
+}
+```
+
+最后为了完成挑战不要忘了在`kern_init`中，开启test。
+
+## Challenge 2
+
+使用键盘完成用户态与内核态的切换
+
+```c
+   case IRQ_OFFSET + IRQ_KBD:
+        c = cons_getc();		// 从控制台获取键盘消息
+        cprintf("kbd [%03d] %c\n", c, c);
+        if(c == '0')			// 输入 0 进行 用户态到内核态的切换
+        {
+            if (tf->tf_cs != KERNEL_CS) {
+                cprintf("+++ switch to  kernel  mode +++\n");
+                tf->tf_cs = KERNEL_CS;
+                tf->tf_ds = tf->tf_es = KERNEL_DS;
+                tf->tf_eflags &= ~FL_IOPL_MASK;
+                switchu2k = (struct trapframe *)(tf->tf_esp - (sizeof(struct trapframe) - 8));
+                memmove(switchu2k, tf, sizeof(struct trapframe) - 8);
+                *((uint32_t *)tf - 1) = (uint32_t)switchu2k;
+            }
+        }
+        else if(c == '3')		// 输入 3 进行 内核态到用户态的切换
+        {
+            if (tf->tf_cs != USER_CS) {
+                cprintf("+++ switch to  user  mode +++\n");
+                switchk2u = *tf;
+                switchk2u.tf_cs = USER_CS;
+                switchk2u.tf_ds = switchk2u.tf_es = switchk2u.tf_ss = USER_DS;
+                switchk2u.tf_esp = (uint32_t)tf + sizeof(struct trapframe) - 8;
+                switchk2u.tf_eflags |= FL_IOPL_MASK;
+                *((uint32_t *)tf - 1) = (uint32_t)&switchk2u;
+            }
+        }
+        break;
+```
+
+切换部分的代码与challenge1相同。
+
+**check**
+
+```bash
+neibelungen@neibelungen:~/os_kernel_lab/labcodes/lab1$ make grade
+Check Output:            (2.5s)
+  -check ring 0:                             OK
+  -check switch to ring 3:                   OK
+  -check switch to ring 0:                   OK
+  -check ticks:                              OK
+Total Score: 40/40
+```
 

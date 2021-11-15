@@ -1,5 +1,3 @@
-
-
 在正式开始写代码之前，我们先看看，整个内存管理的框架
 
 参考：[内存管理迷雾](https://jishuin.proginn.com/p/763bfbd248c0)
@@ -508,7 +506,21 @@ PROVIDE(end = .);
 
 ## 练习1
 
-**实现 first-fit 连续物理内存分配算法**
+>  实现 first-fit 连续物理内存分配算法
+
+在实现前先对list结构进行了解
+
+Code: list.h
+
+```c
+struct list_entry {
+    struct list_entry *prev, *next;
+};
+```
+
+uCore中的双向链表节点的指针域被单独设为一个结构体。这样做的好处是，指针都指向指针域，能够加快对链式结构的操作。如果希望得到整个节点，则可以通过相应的宏，进行指针运算得到。
+
+### default_init
 
 Code:default_pmm.c
 
@@ -522,16 +534,20 @@ default_init(void) {
 
 `free_list`用来维护所有空闲的内存块，是一个空闲链表，在最开始它的`prev`和`next`都指向自身。`nr_free`记录了`free_list`中空闲`page`的数目。
 
+### default_iniy_memmap
+
 ```c
 static void
 default_init_memmap(struct Page *base, size_t n) {
     assert(n > 0);
     struct Page *p = base;
-    for (; p != base + n; p ++) {
+    // initialize each page in this free block
+    for (; p != base + n; p ++) {   
         assert(PageReserved(p));
         p->flags = p->property = 0;
         set_page_ref(p, 0);
     }
+    // set the head page
     base->property = n;
     SetPageProperty(base);
     nr_free += n;
@@ -541,15 +557,22 @@ default_init_memmap(struct Page *base, size_t n) {
 
 `default_init_memmap`用来对块中的每个`page`进行初始化，并将`block`加入到`free_list`中。
 
-在我们实现的`first_fit`算法中，要求`block`按照地址进行排序。而`list_add`中实现的是`list_add_after(listelm, elm);`，即在`free_list`后添加。所以，这里要改成`list_add_before`。
+其中有两个标志位：`PG_reserved`和`PG_property`，对于page，有两种情况，在block的头部或在内部。在物理内存进行初始化时，所有的的页都是不可获得的，即`PG_reserved`被置位。
+而对于`PG_property`，如果该page在block的头部，并且未被申请，置为1。被申请后置为0。如果不是头部块，其总是置为0。
+
+所以我们首先对每个page进行设置，检测`PG_reserved`是否被置位。并将page的`flags`与`property`都清空。并设置起ref为0。之后对头部块进行处理即可。在`first_fit`算法中，要求物理块按照地址从小到大进行排序。
+
+### default_alloc_pages
 
 ```c
 static struct Page *
 default_alloc_pages(size_t n) {
     assert(n > 0);
+    // request bigger than available
     if (n > nr_free) {
         return NULL;
     }
+    // find fisrt fit block
     struct Page *page = NULL;
     list_entry_t *le = &free_list;
     while ((le = list_next(le)) != &free_list) {
@@ -559,31 +582,10 @@ default_alloc_pages(size_t n) {
             break;
         }
     }
-    if (page != NULL) {
-        list_del(&(page->page_link));
-        if (page->property > n) {
-            struct Page *p = page + n;
-            p->property = page->property - n;
-            list_add(&free_list, &(p->page_link));
-    }
-        nr_free -= n;
-        ClearPageProperty(page);
-    }
-    return page;
-}
-```
-
-`default_alloc_pages`用来申请指定数目的空闲`page`。当n大于`nr_free`时，`free_list`必然不能满足需求，返回NULL。
-
-之后遍历`free_list`，查看每一个`page_header`，其`property`记录了该链表中`page`的数目。找到第一个合适的返回。
-
-如果找到了这样的`block`，则将其进行切割（如果必要的话），将剩余的再加入到链表中。
-
-所以对应处改为:
-
-```c
+    // if find a block
     if (page != NULL) {
         if (page->property > n) {
+            // set new head page and link to free_list
             struct Page *p = page + n;
             p->property = page->property - n;
             SetPageProperty(p);
@@ -593,46 +595,52 @@ default_alloc_pages(size_t n) {
         nr_free -= n;
         ClearPageProperty(page);
     }
+    return page;
+}
 ```
+
+`default_alloc_pages`用来申请指定数目的空闲`page`，并且是链表中第一个满足要求的block。当n大于`nr_free`时，`free_list`必然不能满足需求，返回NULL。
+
+之后遍历`free_list`，查看每一个`page_header`，其`property`记录了该链表中`page`的数目。找到第一个合适的返回。
+
+如果找到了这样的`block`，则将其进行切割（如果必要的话），将剩余的再加入到链表中。
+
+### default_free_pages
 
 ```c
 static void
 default_free_pages(struct Page *base, size_t n) {
     assert(n > 0);
     struct Page *p = base;
+    // clear all pages
     for (; p != base + n; p ++) {
         assert(!PageReserved(p) && !PageProperty(p));
         p->flags = 0;
         set_page_ref(p, 0);
     }
+    // set head page
     base->property = n;
     SetPageProperty(base);
+    // traversing the list and merge
     list_entry_t *le = list_next(&free_list);
     while (le != &free_list) {
         p = le2page(le, page_link);
         le = list_next(le);
-        if (base + base->property == p) {
+        // next block in the list
+        if (base + base->property == p) {   
             base->property += p->property;
             ClearPageProperty(p);
             list_del(&(p->page_link));
         }
+        // forward block in the list
         else if (p + p->property == base) {
             p->property += base->property;
             ClearPageProperty(base);
-            base = p;
+            base = p;               // new base
             list_del(&(p->page_link));
         }
     }
-    nr_free += n;
-    list_add(&free_list, &(base->page_link));
-}
-```
-
-`default_free_pages`将被free的`block`重新加入到`free_list`中，并做了相应的合并操作。然而，在这个版本中，将合并后的`block`加入到了链表头部。
-
-所以对应处改为：
-
-```c
+    // insert to free_list
     nr_free += n;
     for(le = list_next(le); le != &free_list; le = list_next(le)) {
         p = le2page(le, page_link);
@@ -641,28 +649,27 @@ default_free_pages(struct Page *base, size_t n) {
             break;
         }
     }
-    list_add_before(&(p->page_link), &(base->page_link));
+    list_add_before(le, &(base->page_link));
+}
 ```
+
+`default_free_pages`将被free的`block`重新加入到`free_list`中，并做了相应的合并操作。然而，在这个版本中，将合并后的`block`加入到了链表头部。
 
 ## 练习2
 
 ```c
-#if 1
-	// &pgdir[PDX(la)] 根据一级页表项索引从一级页表中找到对应的页目录项指针
-    pde_t *pdep = &pgdir[PDX(la)];   	// (1) find page directory entry
-    if (!(*pdep & PTE_P)) {				// (2) check if entry is not present
+    pde_t *pdep = &pgdir[PDX(la)];   	                // (1) find page directory entry
+    pde_t tt = *pdep;
+    if (!(tt & PTE_P)) {				                // (2) check if entry is not present
         struct Page *page;              
-        if(!create || (page = alloc_page()) == NULL) // (3) check if creating is needed, then alloc page for page table
-            return NULL;                  			// CAUTION: this page is used for page table, not for common data page
-        set_page_ref(page, 1);                  	// (4) set page reference
-        uintptr_t pa =  page2pa(page);              // (5) get linear address of page
-        // 使用KADDR(pa)将物理地址转化为虚拟地址，使用`memset`进行清空
-        memset(KADDR(pa), 0, PGSIZE);               // (6) clear page content using memset
-        // 将对应的物理地址设置权限后填入二级页表
-        *pdep = pa | PTE_U | PTE_W | PTE_U;         // (7) set page directory entry's permission
+        if(!create || (page = alloc_page()) == NULL)    // (3) check if creating is needed, then alloc page for page table
+            return NULL;                  			    // CAUTION: this page is used for page table, not for common data page
+        set_page_ref(page, 1);                  	    // (4) set page reference
+        uintptr_t pa =  page2pa(page);                  // (5) get linear address of page
+        memset(KADDR(pa), 0, PGSIZE);                   // (6) clear page content using memset
+        *pdep = pa | PTE_P | PTE_W | PTE_U;             // (7) set page directory entry's permission
     }
-    return &((pte_t *)KADDR(PDE_ADDR(*pdep)))[PTX(la)];          // (8) return page table entry
-#endif
+    return &((pte_t *)KADDR(PDE_ADDR(*pdep)))[PTX(la)];
 ```
 
 `get_pte`给定一个虚拟地址，返回这个虚拟地址在二级页表中对应的项。
@@ -674,7 +681,7 @@ default_free_pages(struct Page *base, size_t n) {
 **释放某虚地址所在的页并取消对应二级页表项的映射**
 
 ```c
-if(*ptep & PTE_P) {								//(1) check if this page table entry is present
+    if(*ptep & PTE_P) {							//(1) check if this page table entry is present
         struct Page *page = pte2page(*ptep);	//(2) find corresponding page to pte
         if (page_ref_dec(page) == 0) {			//(3) decrease page reference
             free_page(page);					//(4) and free this page when page reference reachs 0
@@ -687,4 +694,14 @@ if(*ptep & PTE_P) {								//(1) check if this page table entry is present
 `page_remove_pte`用来解除页的映射。如果该页的存在，清空该页的引用，并将其free。清空其二级页表项和对应的tlb。
 
 对于每一个练习，其实都给了详细的注释，只要理解了概念，那代码不是问题。
+
+## Challenge 1: Buddy system
+
+
+
+
+
+
+
+## Challenge 2: Slub
 

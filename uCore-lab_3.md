@@ -190,3 +190,98 @@ LRU算法和FIFO本质上都是先进先出的思路，只不过LRU是针对页�
 如果分配给一个进程的物理页面太少，不能包含整个的工作集，即常驻集属于工作集，那么进程将会造成很多的页面中断，需要频繁的在内存和外存之间替换页面，从而使进程的运行速度变得很慢，这种状态称为抖动。
 
 产生抖动的原因：随着驻留内存的进程数目增加，分配给每个进程的物理页面数不断减小，缺页率不断上升。所以操作系统要选择一个适当的进程数目和进程所需要的帧数，以便在并发水平和缺页率之间达到一个平衡。
+
+## 练习1
+**给未被映射的地址映射上物理页**
+注意发生`page falut`的两种情况：
+- 物理页未被映射，页表项为空
+- 页表项不为空，对应的物理页面被换出到swap
+
+```c
+    /*LAB3 EXERCISE 1: YOUR CODE*/
+    //(1) try to find a pte, if pte's PT(Page Table) isn't existed, then create a PT.
+    if((ptep = get_pte(mm->pgdir, addr, 1)) == NULL)              
+    {
+        cprintf("get_pte in do_pgfalut failed\n");
+        goto failed;
+    }
+    if (*ptep == 0) {
+        //(2) if the phy addr isn't exist, then alloc a page & map the phy addr with logical addr
+        if(pgdir_alloc_page(mm->pgdir, addr, perm) == NULL) {                    
+            cprintf("pgdir_alloc_page in do_pgfalut failed\n");
+            goto failed;
+        }        
+    }
+    else {
+    /*LAB3 EXERCISE 2: YOUR CODE
+    * Now we think this pte is a swap entry, we should load data from disk to a page with phy addr,
+    * and map the phy addr with logical addr, trigger swap manager to record the access situation of this page.
+    *
+    *  Some Useful MACROs and DEFINEs, you can use them in below implementation.
+    *  MACROs or Functions:
+    *    swap_in(mm, addr, &page) : alloc a memory page, then according to the swap entry in PTE for addr,
+    *                               find the addr of disk page, read the content of disk page into this memroy page
+    *    page_insert ： build the map of phy addr of an Page with the linear addr la
+    *    swap_map_swappable ： set the page swappable
+    */
+
+        if(swap_init_ok) {
+            struct Page *page = NULL;
+            //(1）According to the mm AND addr, try to load the content of right disk page
+            //    into the memory which page managed.
+            if((ret = swap_in(mm, addr, &page)) != 0)
+            {
+                cprintf("swap_in in do_pgfalut failed\n");
+                goto failed;
+            }
+            //(2) According to the mm, addr AND page, setup the map of phy addr <---> logical addr
+            page_insert(mm->pgdir, page, addr, perm);
+            //(3) make the page swappable.
+            swap_map_swappable(mm, addr, page, 1);
+            page->pra_vaddr = addr;
+        }
+        else {
+            cprintf("no swap_init_ok but ptep is %x, failed\n", *ptep);
+            goto failed;
+        }
+   }
+```
+## 练习2
+**补充完成基于FIFO的页面替换算法**
+
+FIFO的PRA维护了一个链表，链表中的页按照从旧（驻留时间最长）到新（最近驻留）的顺序排列。
+
+所以在换入一个页面时，需要将其加入到链表的尾部。换出时，只要将链表头指向的页换出。
+```c
+static int
+_fifo_map_swappable(struct mm_struct *mm, uintptr_t addr, struct Page *page, int swap_in)
+{
+    list_entry_t *head=(list_entry_t*) mm->sm_priv;
+    list_entry_t *entry=&(page->pra_page_link);
+ 
+    assert(entry != NULL && head != NULL);
+    //record the page access situlation
+    /*LAB3 EXERCISE 2: YOUR CODE*/ 
+    //(1)link the most recent arrival page at the back of the pra_list_head qeueue.
+    list_add(head->prev, entry);
+    
+    return 0;
+}
+
+static int
+_fifo_swap_out_victim(struct mm_struct *mm, struct Page ** ptr_page, int in_tick)
+{
+    list_entry_t *head=(list_entry_t*) mm->sm_priv;
+        assert(head != NULL);
+    assert(in_tick==0);
+    /* Select the victim */
+    /*LAB3 EXERCISE 2: YOUR CODE*/ 
+    //(1)  unlink the  earliest arrival page in front of pra_list_head qeueue
+    //(2)  assign the value of *ptr_page to the addr of this page
+    list_entry_t *le = head->next;
+    struct Page *p = le2page(le, pra_page_link);
+    list_del(le);
+    *ptr_page = p;
+    return 0;
+}
+```

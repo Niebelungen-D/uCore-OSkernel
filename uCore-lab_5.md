@@ -338,6 +338,12 @@ do_exit(int error_code) {
     panic("do_exit will not return!! %d.\n", current->pid);
 }
 ```
+
+减少进程mm的指向内存的引用计数，如果必要需要释放其指向内存和mm结构，并清空页表项。设置当前进程的状态为`PROC_ZOMBIE`。
+接着，还判断当前其父进程是否在等待子进程退出，如果是则要唤醒父进程。如果该进程还有子进程，则会被`initproc`领养。并且其哥哥进程变成了当前进程的子进程，由此在循环中`initproc`可以将该进程的所有子进程回收。
+
+进程回收完毕之后，调用`schedule()`让cpu运行下一个进程。
+
 ## wait
 
 ```c
@@ -404,3 +410,177 @@ found:
     return 0;
 }
 ```
+`wait`函数会等待某一子进程（指定PID进程，或者任一子进程）退出（即状态变为PROC_ZOMBIE），然后将对应的子进程从哈希表中解链，清空内核栈和PCB。如果没有子进程处于`PROC_ZOMBIE`状态，则当前进程会变为`PROC_SLEEPING`并执行`schedule`调度其他进程运行，直到子进程退出后，才被唤醒。
+# Challenge: COW
+
+## ucore的COW机制的实现思想
+父进程和子进程之间共享（share）页面而不是复制（copy）页面。但只要页面被共享，它们就不能被修改，即是只读的。注意此共享是指父子进程共享一个表示内存空间的mm_struct结构的变量。当父进程或子进程试图写一个共享的页面，就产生一个页访问异常，这时内核就把这个页复制到一个新的页面中并标记为可写。注意，原来的页面仍然是写保护的。当其它进程试图写入时，ucore检查写进程是否是这个页面的唯一属主（通过判断page_ref 和 swap_page_count 即 mem_map 中相关 entry 保存的值的和是否为1。）如果是，它把这个页面标记为对这个进程是可写的。
+
+在具体实现上，ucore调用dup_mmap函数，并进一步调用copy_range函数来具体完成对页表内容的复制，这样两个页表表示同一个虚拟地址空间（包括对应的物理地址空间），且还需修改两个页表中每一个页对应的页表项属性为只读，但。在这种情况下，两个进程有两个页表，但这两个页表只映射了一块只读的物理内存。同理，对于换出的页，也采用同样的办法来共享一个换出页。综上所述，我们可以总结出：如果一个页的PTE属性是只读的，但此页所属的VMA描述指出其虚地址空间是可写的，则这样的页是COW页。
+
+当对这样的地址空间进行写操作的时候，会触发do_pgfault函数被调用。此函数如果发现是COW页，就会调用alloc_page函数新分配一个物理页，并调用memcpy函数把旧页的内容复制到新页中，并最后调用page_insert函数给当前产生缺页错的进程建立虚拟页地址到新物理页地址的映射关系（即改写PTE，并设置此页为可读写）。
+
+这里还有一个特殊情况，如果产生访问异常的页已经被换出到硬盘上了，则需要把此页通过swap_in_page函数换入到内存中来，如果进一步发现换入的页是一个COW页，则把其属性设置为只读，然后异常处理结束返回。但这样重新执行产生异常的写操作，又会触发一次内存访问异常，则又要执行上一段描述的过程了。
+
+Page结构的ref域用于跟踪共享相应页面的进程数目。只要进程释放一个页面或者在它上面执行写时复制，它的ref域就递减；只有当ref变为0时，这个页面才被释放。
+
+## DO IT
+
+在`copy_range`中通过判断share参数是否被指定，选择是share还是完全复制。
+```c
+int
+copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share) {
+    assert(start % PGSIZE == 0 && end % PGSIZE == 0);
+    assert(USER_ACCESS(start, end));
+    // copy content by page unit.
+    do {
+        //call get_pte to find process A's pte according to the addr start
+        pte_t *ptep = get_pte(from, start, 0), *nptep;
+        if (ptep == NULL) {
+            start = ROUNDDOWN(start + PTSIZE, PTSIZE);
+            continue ;
+        }
+        //call get_pte to find process B's pte according to the addr start. If pte is NULL, just alloc a PT
+        if (*ptep & PTE_P) {
+            if ((nptep = get_pte(to, start, 1)) == NULL) {
+                return -E_NO_MEM;
+            }
+        uint32_t perm = (*ptep & PTE_USER);
+        //get page from ptep
+        struct Page *page = pte2page(*ptep);
+        int ret=0;
+        if(share)	// 如果是共享的只需要将页表项复制即可。
+        {
+            ret = page_insert(to, page, start, perm &~ PTE_W);
+            // page_insert(from, page, start, perm &~ PTE_W);
+        }
+        else {
+        // alloc a page for process B
+            struct Page *npage = alloc_page();
+            assert(page!=NULL);
+            assert(npage!=NULL);
+            uintptr_t src_kvaddr = page2kva(page);
+            uintptr_t dst_kvaddr = page2kva(npage);
+            memcpy(dst_kvaddr, src_kvaddr, PGSIZE);
+            ret = page_insert(to, npage, start, perm);
+        }
+        assert(ret == 0);
+        start += PGSIZE;
+    } while (start != 0 && start < end);
+    return 0;
+}
+```
+
+修改`do_pgfault`
+```c
+int
+do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr) {
+    int ret = -E_INVAL;
+    //try to find a vma which include addr
+    struct vma_struct *vma = find_vma(mm, addr);
+
+    pgfault_num++;
+    //If the addr is in the range of a mm's vma?
+    if (vma == NULL || vma->vm_start > addr) {
+        cprintf("not valid addr %x, and  can not find it in vma\n", addr);
+        goto failed;
+    }
+    //check the error_code
+    switch (error_code & 3) {
+    default:
+            /* error code flag : default is 3 ( W/R=1, P=1): write, present */
+    case 2: /* error code flag : (W/R=1, P=0): write, not present */
+        if (!(vma->vm_flags & VM_WRITE)) {
+            cprintf("do_pgfault failed: error code flag = write AND not present, but the addr's vma cannot write\n");
+            goto failed;
+        }
+        break;
+    case 1: /* error code flag : (W/R=0, P=1): read, present */
+        cprintf("do_pgfault failed: error code flag = read AND present\n");
+        goto failed;
+    case 0: /* error code flag : (W/R=0, P=0): read, not present */
+        if (!(vma->vm_flags & (VM_READ | VM_EXEC))) {
+            cprintf("do_pgfault failed: error code flag = read AND not present, but the addr's vma cannot read or exec\n");
+            goto failed;
+        }
+    }
+    /* IF (write an existed addr ) OR
+     *    (write an non_existed addr && addr is writable) OR
+     *    (read  an non_existed addr && addr is readable)
+     * THEN
+     *    continue process
+     */
+    uint32_t perm = PTE_U;
+    if (vma->vm_flags & VM_WRITE) {
+        perm |= PTE_W;
+    }
+    addr = ROUNDDOWN(addr, PGSIZE);
+
+    ret = -E_NO_MEM;
+
+    pte_t *ptep=NULL;
+
+#if 1
+    //(1) try to find a pte, if pte's PT(Page Table) isn't existed, then create a PT.
+    if((ptep = get_pte(mm->pgdir, addr, 1)) == NULL)              
+    {
+        cprintf("get_pte in do_pgfalut failed\n");
+        goto failed;
+    }
+    if (*ptep == 0) {
+        //(2) if the phy addr isn't exist, then alloc a page & map the phy addr with logical addr
+        if(pgdir_alloc_page(mm->pgdir, addr, perm) == NULL) {                    
+            cprintf("pgdir_alloc_page in do_pgfalut failed\n");
+            goto failed;
+        }        
+    }
+    else {
+        struct Page *page = NULL;
+        if(*ptep & PTE_P)	// 如果是COW的页
+        {
+            if(page_ref(page) > 1) 
+            {
+                struct Page *npage = alloc_page();
+                page = pte2page(*ptep);
+                assert(page!=NULL);
+                assert(npage!=NULL);
+                void *src_kvaddr = page2kva(page);
+                void *dst_kvaddr = page2kva(npage);
+                memcpy(dst_kvaddr, src_kvaddr, PGSIZE);
+                // page_remove(mm->pgdir, addr);
+                // page_ref_dec(page);
+                ret = page_insert(mm->pgdir, npage, addr, perm&PTE_W);  
+            }
+            else
+                ret = page_insert(mm->pgdir, page, addr, perm&PTE_W); 
+          
+        }
+        else {
+            if(swap_init_ok) {
+                //(1）According to the mm AND addr, try to load the content of right disk page
+                //    into the memory which page managed.
+                if((ret = swap_in(mm, addr, &page)) != 0)
+                {
+                    cprintf("swap_in in do_pgfalut failed\n");
+                    goto failed;
+                }
+                //(2) According to the mm, addr AND page, setup the map of phy addr <---> logical addr
+                page_insert(mm->pgdir, page, addr, perm);
+                //(3) make the page swappable.
+                swap_map_swappable(mm, addr, page, 1);
+                page->pra_vaddr = addr;
+            }
+            else {
+                cprintf("no swap_init_ok but ptep is %x, failed\n", *ptep);
+                goto failed;
+            }
+        }
+   }
+#endif
+   ret = 0;
+failed:
+    return ret;
+}
+```
+
+如果是COW的页，则要为当前进程创建一个页的拷贝，并替换这个进程的页表，设置权限为可读可写。在执行COW时，都会有一个页失去对共享页的引用，这个在我们进行页表的更新时就完成了。如果当前的页仅有一个引用，那么只需要更新页表重新设置权限即可，不需要仔申请新的页面了。
